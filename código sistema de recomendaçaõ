@@ -1,0 +1,350 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import re
+import nltk
+import unicodedata
+import isodate
+from googleapiclient.discovery import build
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import plotly.express as px
+import plotly.graph_objects as go
+
+nltk.download('stopwords')
+stopwords_pt = set(nltk.corpus.stopwords.words('portuguese'))
+
+API_KEY = 'AIzaSyBWb8Kq3Tmr3rqq4CBVscyFuuV-4oqqQPo'  # sua chave
+
+def preprocess(text):
+    text = str(text).lower()
+    text = remover_acentos(text)
+    text = re.sub(r'[^\w\s]', '', text)
+    tokens = text.split()
+    tokens = [t for t in tokens if t not in stopwords_pt]
+    return ' '.join(tokens)
+
+def remover_acentos(txt):
+    return ''.join([c for c in unicodedata.normalize('NFD', str(txt)) if unicodedata.category(c) != 'Mn'])
+
+def get_video_duration(videoId):
+    try:
+        youtube = build('youtube', 'v3', developerKey=API_KEY)
+        details_request = youtube.videos().list(part="contentDetails", id=videoId)
+        details_response = details_request.execute()
+        if details_response['items']:
+            iso_dur = details_response['items'][0]['contentDetails']['duration']
+            dur = isodate.parse_duration(iso_dur)
+            return dur.total_seconds()
+    except Exception:
+        pass
+    return None
+
+def youtube_search(query, max_results=10):
+    youtube = build('youtube', 'v3', developerKey=API_KEY)
+    request = youtube.search().list(
+        q=query,
+        part="snippet",
+        type="video",
+        maxResults=max_results
+    )
+    response = request.execute()
+    videos = []
+    for item in response['items']:
+        video_id = item['id'].get('videoId')
+        if not video_id:
+            continue
+        videos.append({
+            "titulo": item['snippet']['title'],
+            "canal": item['snippet']['channelTitle'],
+            "descricao": item['snippet']['description'],
+            "videoId": video_id,
+            "url_video": f"https://www.youtube.com/watch?v={video_id}",
+            "url_capa": item['snippet']['thumbnails']['high']['url'] if 'high' in item['snippet']['thumbnails'] else "",
+            "publicacao": item['snippet'].get('publishedAt', ''),
+        })
+    return pd.DataFrame(videos)
+
+def get_video_metrics(videoId):
+    try:
+        youtube = build('youtube', 'v3', developerKey=API_KEY)
+        stats_request = youtube.videos().list(part="statistics", id=videoId)
+        stats_response = stats_request.execute()
+        if stats_response['items']:
+            stats = stats_response['items'][0]['statistics']
+            views = int(stats.get('viewCount', 0))
+            likes = int(stats.get('likeCount', 0))
+            return views, likes
+    except Exception:
+        pass
+    return 0, 0
+
+def adicionar_favorito(row):
+    for fav in st.session_state["favoritos"]:
+        if fav["videoId"] == row.videoId:
+            return
+    favorito = {
+        "videoId": row.videoId,
+        "titulo": row.titulo,
+        "canal": row.canal,
+        "descricao": row.descricao,
+        "url_video": row.url_video,
+        "url_capa": row.url_capa,
+        "publicacao": row.publicacao
+    }
+    st.session_state["favoritos"].append(favorito)
+
+def jaccard_similarity(str1, str2):
+    set1 = set(str1.split())
+    set2 = set(str2.split())
+    return len(set1 & set2) / len(set1 | set2) if set1 | set2 else 0.0
+
+st.set_page_config(page_title="Recomendador de Músicas YouTube Music", layout="wide")
+st.markdown("<h1 style='text-align: center; color: #d50000;'>🎶 Recomendador de Músicas YouTube Music</h1>", unsafe_allow_html=True)
+st.divider()
+st.info("Busque por artista, música ou gênero! Os vídeos do YouTube Music serão exibidos e podem ser reproduzidos direto no app.")
+
+if "consulta_usuario" not in st.session_state:
+    st.session_state["consulta_usuario"] = ""
+if "favoritos" not in st.session_state:
+    st.session_state["favoritos"] = []
+if "atualizar_busca" not in st.session_state:
+    st.session_state["atualizar_busca"] = False
+if "modo_demo" not in st.session_state:
+    st.session_state["modo_demo"] = False
+
+st.sidebar.header("Filtros e preferências")
+if st.sidebar.button("Modo demonstração (offline)"):
+    st.session_state["modo_demo"] = True
+if st.sidebar.button("Voltar para modo real"):
+    st.session_state["modo_demo"] = False
+
+filtro_ano = st.sidebar.slider("Ano de publicação", 2008, 2025, (2015,2025), key="filtro_ano")
+max_result = st.sidebar.slider("Quantidade de resultados", 5, 20, 8, key="max_results")
+ordenacao = st.sidebar.selectbox(
+    "Ordenar por", 
+    ["Mais novo", "Mais antigo", "Mais visualizações", "Mais curtidas"], 
+    index=0
+)
+duracao = st.sidebar.selectbox(
+    "Duração do vídeo",
+    ["Todas", "Até 4 minutos", "4 a 10 minutos", "Mais de 10 minutos"],
+    index=0
+)
+apenas_com_descricao = st.sidebar.checkbox("Apenas com descrição?", value=False)
+
+def on_change_consulta():
+    st.session_state["atualizar_busca"] = True
+    st.session_state["consulta_usuario"] = st.session_state["consulta_input"]
+
+consulta_usuario = st.text_input(
+    "Digite artista, música, gênero...",
+    value=st.session_state["consulta_usuario"],
+    key="consulta_input",
+    on_change=on_change_consulta
+)
+
+buscar_ativado = st.button("Buscar músicas/vídeos 🔎")
+if buscar_ativado:
+    st.session_state["consulta_usuario"] = st.session_state["consulta_input"]
+    st.session_state["atualizar_busca"] = True
+
+max_render_cards = 10
+max_render_favs = 10
+
+if st.session_state.get("modo_demo"):
+    st.markdown("#### ⚡ MODO DEMONSTRAÇÃO: Calculando similaridade de exemplos!")
+    df_videos = pd.DataFrame([
+        {"titulo": "Evidências", "canal": "Chitãozinho & Xororó", "descricao": "Clássico sertanejo", "videoId": "vid1","url_video":"https://youtu.be/demo1","url_capa": "", "publicacao":"2015-02-10T00:00:00Z"},
+        {"titulo": "Ai Se Eu Te Pego", "canal": "Michel Teló", "descricao": "Sucesso mundial", "videoId": "vid2","url_video":"https://youtu.be/demo2","url_capa":"", "publicacao":"2012-06-10T00:00:00Z"},
+        {"titulo": "Assim Você Mata o Papai", "canal": "Sorriso Maroto", "descricao": "Pagode romântico", "videoId": "vid3","url_video":"https://youtu.be/demo3","url_capa":"", "publicacao":"2018-09-23T00:00:00Z"},
+        {"titulo": "Show das Poderosas", "canal": "Anitta", "descricao": "Pop nacional", "videoId": "vid4","url_video":"https://youtu.be/demo4","url_capa":"", "publicacao":"2014-01-02T00:00:00Z"},
+        {"titulo": "Beijinho no Ombro", "canal": "Valesca Popozuda", "descricao": "Funk poderoso", "videoId": "vid5","url_video":"https://youtu.be/demo5","url_capa":"", "publicacao":"2013-05-29T00:00:00Z"}
+    ])
+    query = preprocess(st.session_state["consulta_usuario"])
+else:
+    df_videos = pd.DataFrame()
+    if st.session_state["consulta_usuario"]:
+        query = preprocess(st.session_state["consulta_usuario"])
+        if st.session_state.get("atualizar_busca", False):
+            st.session_state["atualizar_busca"] = False
+            with st.spinner("Buscando vídeos no YouTube..."):
+                df_videos = youtube_search(query, max_results=st.session_state["max_results"])
+            st.session_state["df_videos"] = df_videos.copy()
+        else:
+            df_videos = st.session_state.get("df_videos", pd.DataFrame())
+
+if len(df_videos) > 0:
+    df_videos = df_videos.drop_duplicates(subset=['titulo', 'canal'])
+    if st.session_state["filtro_ano"]:
+        ano_inicio, ano_fim = st.session_state["filtro_ano"]
+        df_videos['ano_publicacao'] = pd.to_datetime(df_videos['publicacao'], errors='coerce').dt.year
+        df_videos = df_videos[
+            (df_videos['ano_publicacao'] >= ano_inicio) &
+            (df_videos['ano_publicacao'] <= ano_fim)
+        ]
+    if apenas_com_descricao:
+        df_videos = df_videos[df_videos['descricao'].str.strip() != ""]
+    if duracao != "Todas" and not st.session_state.get("modo_demo"):
+        lista_duracao = []
+        for vid in df_videos['videoId']:
+            lista_duracao.append(get_video_duration(vid))
+        df_videos['duracao_seg'] = lista_duracao
+        if duracao == "Até 4 minutos":
+            df_videos = df_videos[df_videos['duracao_seg'].notna() & (df_videos['duracao_seg'] <= 240)]
+        elif duracao == "4 a 10 minutos":
+            df_videos = df_videos[df_videos['duracao_seg'].notna() & (df_videos['duracao_seg'] > 240) & (df_videos['duracao_seg'] <= 600)]
+        elif duracao == "Mais de 10 minutos":
+            df_videos = df_videos[df_videos['duracao_seg'].notna() & (df_videos['duracao_seg'] > 600)]
+    df_videos['publicacao_dt'] = pd.to_datetime(df_videos['publicacao'], errors='coerce')
+    if ordenacao == "Mais novo":
+        df_videos = df_videos.sort_values(by="publicacao_dt", ascending=False)
+    elif ordenacao == "Mais antigo":
+        df_videos = df_videos.sort_values(by="publicacao_dt", ascending=True)
+    elif ordenacao in ["Mais visualizações", "Mais curtidas"] and not st.session_state.get("modo_demo"):
+        metric_col = "views" if ordenacao == "Mais visualizações" else "likes"
+        metric_list = []
+        for vid in df_videos['videoId']:
+            views, likes = get_video_metrics(vid)
+            metric_list.append(views if metric_col == "views" else likes)
+        df_videos[metric_col] = metric_list
+        df_videos = df_videos.sort_values(by=metric_col, ascending=False)
+
+tab1, tab2, tab3 = st.tabs(["Busca", "Dashboard de Gráficos", "Explicação do Algoritmo"])
+
+sim_scores_mean = None
+score_hibrido = None
+corpus = []
+historico_textos = []
+vectorizer = None
+
+with tab1:
+    st.markdown("## 🔍 Resultados da Busca")
+    st.write(f"Encontrados {len(df_videos)} vídeos:")
+
+    if len(df_videos) > 0:
+        corpus = df_videos.apply(lambda row: preprocess(f"{row['titulo']} {row['canal']} {row['descricao']}"), axis=1).tolist()
+        vectorizer = TfidfVectorizer(ngram_range=(1, 2))
+        tfidf_matrix = vectorizer.fit_transform(corpus)
+        if st.session_state["favoritos"]:
+            historico_textos = [preprocess(f"{fav['titulo']} {fav['canal']} {fav['descricao']}") for fav in st.session_state["favoritos"]]
+        elif st.session_state["consulta_usuario"]:
+            historico_textos = [preprocess(st.session_state["consulta_usuario"])]
+        if historico_textos:
+            historico_vec = vectorizer.transform(historico_textos)
+            sim_scores = cosine_similarity(historico_vec, tfidf_matrix)
+            sim_scores_mean = np.mean(sim_scores, axis=0)
+            scores_jaccard = [
+                jaccard_similarity(historico_textos[0], doc) for doc in corpus
+            ]
+            score_hibrido = np.maximum(sim_scores_mean, scores_jaccard)
+
+                        # Bônus: reforça score quando título/canal contém o histórico
+            for i, (idx_row, row) in enumerate(df_videos.iterrows()):
+                titulo_canal = preprocess(f"{row['titulo']} {row['canal']}")
+                if any(h in titulo_canal for h in historico_textos):
+                    score_hibrido[i] = 1.0
+
+            idx_ordem = np.argsort(score_hibrido)[::-1][:5]
+            st.markdown("#### 🔥 Recomendações e similaridade (Score Híbrido)")
+            for idx in idx_ordem:
+                similar_row = df_videos.iloc[idx]
+                st.markdown(
+                    f"**{similar_row['titulo']}** — {similar_row['canal']}  \n"
+                    f"Score Híbrido: {score_hibrido[idx]:.2f}  \n"
+                    f"Score Cosseno: {sim_scores_mean[idx]:.2f}  \n"
+                    f"Score Jaccard: {scores_jaccard[idx]:.2f}"
+                )
+                st.video(similar_row['url_video'])
+        else:
+            st.info("Nenhum histórico de busca ou favorito encontrado. Realize uma busca ou adicione músicas à playlist para receber recomendações.")
+
+    if not df_videos.empty:
+        st.divider()
+        st.info(f"Mostrando até {max_render_cards} vídeos (de {len(df_videos)})")
+        cols = st.columns(min(max_render_cards, 4))
+        for i, row in enumerate(df_videos.itertuples()):
+            if i >= max_render_cards:
+                break
+            with cols[i % len(cols)]:
+                st.image(row.url_capa if row.url_capa else "https://img.youtube.com/vi/{}/0.jpg".format(row.videoId), width=220)
+                st.markdown(f"**{row.titulo}**", unsafe_allow_html=True)
+                st.markdown(f"*Canal: {row.canal}*  \nPublicado: {str(row.publicacao)[:10]}", unsafe_allow_html=True)
+                st.markdown(row.descricao[:80] + "..." if row.descricao else "*Sem descrição*")
+                st.video(row.url_video)
+                st.markdown(f"[🔗 Abrir no YouTube]({row.url_video})", unsafe_allow_html=True)
+                views, likes = get_video_metrics(row.videoId) if not st.session_state.get("modo_demo") else (0,0)
+                st.metric("Visualizações", views)
+                st.metric("Likes", likes)
+                if st.button("Favoritar", key=f"fav_{row.videoId}"):
+                    adicionar_favorito(row)
+                if any(fav["videoId"] == row.videoId for fav in st.session_state["favoritos"]):
+                    st.success("Favoritado!")
+
+        st.divider()
+        st.markdown("### 💖 Playlist Favoritos (baixe como CSV!)")
+        st.info(f"Mostrando até {max_render_favs} favoritos (de {len(st.session_state['favoritos'])})")
+        if len(st.session_state["favoritos"]) == 0:
+            st.info("Nenhum vídeo na playlist!")
+        else:
+            fav_df = pd.DataFrame(st.session_state["favoritos"])
+            for i, fav in enumerate(st.session_state["favoritos"]):
+                if i >= max_render_favs:
+                    break
+                st.image(fav["url_capa"] if fav["url_capa"] else "https://img.youtube.com/vi/{}/0.jpg".format(fav["videoId"]), width=130)
+                st.markdown(f"**{fav['titulo']}** — *{fav['canal']}*")
+                st.video(fav["url_video"])
+                st.write(f"Publicado: {fav['publicacao'][:10]}")
+                st.write(f"Link: {fav['url_video']}")
+            csv = fav_df.to_csv(index=False, sep=";")
+            st.download_button(
+                label="Baixar playlist em CSV!",
+                data=csv,
+                file_name="playlist_favoritos.csv",
+                mime="text/csv"
+            )
+
+with tab2:
+    if len(df_videos) > 0 and score_hibrido is not None:
+        st.markdown("## 📊 Dashboard de Gráficos de Similaridade")
+        nomes = [f"{row['titulo']} - {row['canal']}" for _, row in df_videos.iterrows()]
+        fig_hibrido = px.bar(
+            x=nomes, y=score_hibrido,
+            labels={"x": "Música", "y": "Score Híbrido"},
+            title="Score Híbrido de Similaridade das Recomendações"
+        )
+        fig_cosseno = go.Figure(go.Scatter(x=nomes, y=sim_scores_mean, mode='lines+markers', name='Score Cosseno'))
+        fig_cosseno.update_layout(title="Distribuição dos Scores de Similaridade Cosseno",
+                                  xaxis_title="Vídeo",
+                                  yaxis_title="Score de Similaridade")
+        st.plotly_chart(fig_hibrido)
+        st.plotly_chart(fig_cosseno)
+    else:
+        st.info("Busque músicas primeiro para visualizar os gráficos de desempenho.")
+
+with tab3:
+    if len(df_videos) > 0 and historico_textos and vectorizer is not None:
+        st.markdown("## Passo a passo e funcionamento do algoritmo")
+        st.write("Tokens do termo de busca/histórico:", historico_textos[0].split())
+        st.write("Primeiros 20 tokens do vocabulário TF-IDF:", vectorizer.get_feature_names_out()[:20])
+        st.write("Tokens completos do vocabulário TF-IDF (total: {}):".format(len(vectorizer.get_feature_names_out())))
+        st.write(vectorizer.get_feature_names_out().tolist())
+        user_tokens = set(historico_textos[0].split())
+        vocab_tokens = set(vectorizer.get_feature_names_out())
+        st.write("Tokens da busca presentes no vocabulário:", list(user_tokens & vocab_tokens))
+        st.write("Vetor TF-IDF do termo de busca (primeiras 20 dimensões):", vectorizer.transform([historico_textos[0]]).toarray()[0][:20])
+        st.write("Score de Similaridade Cosseno:", sim_scores_mean[:10] if sim_scores_mean is not None else None)
+        st.write("Score Jaccard:", [jaccard_similarity(historico_textos[0], doc) for doc in corpus[:10]])
+        st.write("Score Híbrido:", score_hibrido[:10] if score_hibrido is not None else None)
+        st.markdown("""
+        - O sistema padroniza (lower case, sem acento, retira stopwords) todos os textos.
+        - Calcula **TF-IDF** de busca/favoritos e cada vídeo.
+        - **Similaridade de cosseno**: grau de alinhamento entre os vetores.
+        - **Similaridade Jaccard**: interseção de tokens/palavras.
+        - O score final mostrado é **máx(score cosseno, score Jaccard)**.
+        - Se houver match exato no título ou canal, o score é 1 (bônus).
+        - Resultado: recomendações ordenadas pelo maior score híbrido.
+        - **O vetor TF-IDF pode ser zerado se nenhum token do histórico estiver no vocabulário TF-IDF**.
+        """)
+    else:
+        st.info("Busque músicas para ativar explicação do algoritmo.")
